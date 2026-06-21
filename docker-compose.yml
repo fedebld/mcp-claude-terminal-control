@@ -1,0 +1,55 @@
+# Deploy of the claude-terminal-control MCP facade.
+# House pattern (web-search-hub / codebase-dumper / youtube-to-markdown): a bridge
+# container whose port is published ONLY on the Tailscale IP. NOT systemd — Docker-managed.
+#
+# Deploy (on the chosen host):
+#   cd /opt/mcp-claude-terminal-control
+#   export HOST_TS_IP=$(tailscale ip -4 | head -1)      # publish only on Tailscale
+#   export APP_UID=$(id -u)                              # so the ro-mounted ssh key is readable
+#   docker compose up -d --build
+#   curl -s http://$HOST_TS_IP:8770/health
+#
+# PORTABILITY: defaults assume the container runs on 219 (100.94.187.21), which is the
+# IP authorised in 269's `from="..."` restriction. To run it elsewhere, either add that
+# host's Tailscale IP to 269's authorized_keys `from=`, or set SSH_PROXYJUMP to hop via 219.
+services:
+  claude-terminal-control:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-1000}
+    image: mcp-claude-terminal-control:0.1
+    container_name: mcp_claude_terminal_control
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8770
+      MCP_PATH: /mcp
+      # --- how the pilot reaches claude ---
+      SSH_TARGET: claudeusr@claude-code
+      SSH_KEY: /app/keys/jump_fleet
+      KNOWN_HOSTS: /app/home/.ssh/known_hosts
+      SSH_PROXYJUMP: ""            # set "llmadmin@100.94.187.21" if running off-219
+      # --- delay-er (blocking, randomized 2–9 min) ---
+      PACING_DEFAULT: "false"      # opt-in per call via pace=true; flip to "true" for autonomous loops
+      PACING_MIN_S: "120"
+      PACING_MAX_S: "540"
+      # --- guardrails / good-use ---
+      MAX_SESSIONS: "4"
+      IDLE_TTL_S: "1800"
+      MAX_PROMPT_CHARS: "8000"
+      MAX_OUTPUT_CHARS: "8000"
+      MAX_ASKS_PER_SESSION: "200"
+      ASK_TIMEOUT_S: "180"
+      AUTO_APPROVE: "false"        # surface permission dialogs to the caller by default
+      # AUTH_TOKEN: "set-me"       # optional Bearer on the HTTP layer (fail-closed if set)
+    volumes:
+      # The jump key, read-only. Mode 600 on the host; the container user shares its uid.
+      - ${HOME}/.ssh/jump_fleet:/app/keys/jump_fleet:ro
+    ports:
+      - "${HOST_TS_IP:-100.94.187.21}:8770:8770"   # Tailscale-only exposure, like the other MCPs
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
