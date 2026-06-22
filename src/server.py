@@ -81,6 +81,13 @@ AUTH_TOKEN          = os.environ.get("AUTH_TOKEN", "").strip()     # optional Be
 AUTO_APPROVE        = os.environ.get("AUTO_APPROVE", "false").lower() in ("1", "true", "yes")
 # Default answer-extraction mode: hash (verified file channel) | frame | none (legacy scrape).
 INTEGRITY_DEFAULT   = os.environ.get("INTEGRITY_DEFAULT", "hash").lower()
+# Operator call-out: on a determinism/verification failure, STOP and notify a human via the
+# telegram-notify MCP gateway. Fail-closed semantics: we never return a guessed answer.
+NOTIFY_ENABLED      = os.environ.get("NOTIFY_ENABLED", "true").lower() in ("1", "true", "yes")
+NOTIFY_MCP_URL      = os.environ.get("NOTIFY_MCP_URL", "http://100.94.187.21:8771/mcp")
+NOTIFY_SENDER       = os.environ.get("NOTIFY_SENDER", "claude-terminal-control")
+NOTIFY_ON           = {x.strip() for x in os.environ.get(
+                          "NOTIFY_ON", "nondeterministic,integrity_fail,timeout").split(",") if x.strip()}
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -330,10 +337,14 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
                           Byte-exact; truncation/tamper ⇒ status="integrity_fail" (fail-closed).
                           May need shell approval — auto-approved ONLY for this turn's
                           /tmp/cp_<nonce> path (zero-trust scoping).
-      "frame" — answer wrapped between per-nonce BEGIN/END marker lines in the pane; the
-                facade extracts exactly between matched markers (deterministic boundaries,
-                no hash, no tools/approvals). verified=false.
+      "frame" — answer wrapped between per-nonce BEGIN/END marker lines in the pane; extracted
+                ONLY if the two markers are clean bare lines with no rendering artifacts.
+                Plaintext-only & fail-closed: if claude rendered the output (markers mangled),
+                returns status="nondeterministic" and notifies the operator — never a guess.
       "none"  — legacy best-effort chrome-filtered scrape. verified=false.
+
+    On nondeterministic / integrity_fail / timeout the facade STOPS and calls a human via the
+    telegram-notify gateway (NOTIFY_*). It never returns a guessed answer on those.
 
     pace: if true (or PACING_DEFAULT), sleep a random 2–9 min BEFORE sending (blocking).
     """
@@ -438,27 +449,38 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
     if not done:
         if mode == "hash":
             _ssh_exec(s.target, f"rm -f {shlex.quote(path)}")  # cleanup on timeout too
-        tail = "\n".join(l for l in captured.splitlines() if not _looks_like_chrome(l))[-MAX_OUTPUT_CHARS:]
-        return {"status": "timeout", "paced_s": round(paced_s),
-                "answer": tail, "note": f"no completion within {timeout}s"}
+        # Frame: if the marker tokens are present but never matched as clean bare lines, claude
+        # rendered/mangled them — that's non-determinism, not a plain timeout.
+        if mode == "frame" and (begin in captured or end in captured):
+            scr = "\n".join(l for l in _capture_screen(s.tmux).splitlines() if l.strip())[-600:]
+            return _finalize_error("nondeterministic", s, mode,
+                                   "frame markers present but mangled/rendered — not parseable as bare lines",
+                                   paced_s, {"screen": scr})
+        tail = "\n".join(l for l in captured.splitlines() if not _looks_like_chrome(l))[-600:]
+        return _finalize_error("timeout", s, mode, f"no completion within {timeout}s",
+                               paced_s, {"tail": tail[-MAX_OUTPUT_CHARS:]})
 
-    # ---- post: verify / extract ----
+    # ---- post: verify / extract (fail-closed) ----
     if mode == "hash":
         rc, data = _ssh_exec(s.target, f"cat {shlex.quote(path)}")
         _ssh_exec(s.target, f"rm -f {shlex.quote(path)}")  # cleanup the per-turn artifact
         if rc != 0:
-            return {"status": "integrity_fail", "verified": False, "paced_s": round(paced_s),
-                    "reason": "answer artifact unreadable at source"}
+            return _finalize_error("integrity_fail", s, mode, "answer artifact unreadable at source", paced_s)
         h, n = _sha256_len(data)
         ch_h, ch_n = claimed
-        verified = (h == ch_h and n == ch_n)
+        if h != ch_h or n != ch_n:
+            return _finalize_error("integrity_fail", s, mode,
+                                   f"hash/len mismatch (got {h[:16]}…/{n}, claimed {ch_h[:16]}…/{ch_n})",
+                                   paced_s, {"sha256": h, "len": n,
+                                             "claimed_sha256": ch_h, "claimed_len": ch_n})
         answer = data.decode("utf-8", "replace").rstrip("\n")
-        return {"status": "ok" if verified else "integrity_fail", "verified": verified,
-                "paced_s": round(paced_s), "len": n, "sha256": h,
-                "claimed_len": ch_n, "claimed_sha256": ch_h,
-                "answer": answer[:MAX_OUTPUT_CHARS]}
+        return {"status": "ok", "verified": True, "paced_s": round(paced_s),
+                "len": n, "sha256": h, "answer": answer[:MAX_OUTPUT_CHARS]}
     if mode == "frame":
-        answer = _extract_between(captured, begin, end)
+        answer, reason = _extract_frame(captured, begin, end)
+        if reason:
+            scr = "\n".join(l for l in _capture_screen(s.tmux).splitlines() if l.strip())[-600:]
+            return _finalize_error("nondeterministic", s, mode, reason, paced_s, {"screen": scr})
         return {"status": "ok", "verified": False, "paced_s": round(paced_s),
                 "answer": answer[:MAX_OUTPUT_CHARS]}
     answer = _extract_answer(captured, line, marker)
@@ -514,15 +536,59 @@ def _mnorm(line: str) -> str:
     return re.sub(r"^[●⏺•·]\s*", "", s).strip()
 
 
-def _extract_between(captured: str, begin: str, end: str) -> str:
+_BOX = "│─╭╮╰╯├┤┬┴┼┐┌└┘"  # TUI box-drawing — only appears when claude RENDERS output
+
+
+def _extract_frame(captured: str, begin: str, end: str):
+    """Strict, fail-closed extraction for frame mode. Returns (text, None) only when the two
+    markers appear EXACTLY once each as clean bare lines, in order, with no marker leakage and
+    no box-drawing in the body (which would mean claude rendered, i.e. non-deterministic).
+    Otherwise returns (None, reason)."""
     lines = captured.splitlines()
+    bi = [i for i, l in enumerate(lines) if _mnorm(l) == begin]
+    ei = [i for i, l in enumerate(lines) if _mnorm(l) == end]
+    if len(bi) != 1 or len(ei) != 1 or bi[0] >= ei[0]:
+        return None, "frame markers not present as exactly one clean bare line each (claude likely rendered the output)"
+    body_lines = lines[bi[0] + 1:ei[0]]
+    if any(begin in _mnorm(l) or end in _mnorm(l) for l in body_lines):
+        return None, "marker token leaked inside the body — ambiguous"
+    if any(c in l for l in body_lines for c in _BOX):
+        return None, "box-drawing in body — claude rendered the answer (frame is plaintext-only)"
+    body = [re.sub(r"^\s*[●⏺•·]\s+", "", l) for l in body_lines]
+    return "\n".join(body).strip(), None
+
+
+def _notify(content: str) -> None:
+    """Best-effort operator call-out via the telegram-notify MCP gateway. Never raises:
+    a notification failure must not change the (already fail-closed) result."""
+    if not NOTIFY_ENABLED:
+        return
+    safe = content.replace("<", "‹").replace(">", "›")  # avoid HTML parse-mode choking on <<< >>>
     try:
-        bi = max(i for i, l in enumerate(lines) if _mnorm(l) == begin)
-        ei = min(i for i, l in enumerate(lines) if _mnorm(l) == end and i > bi)
-    except ValueError:
-        return "(framing markers not found — inspect with claude_screen)"
-    body = [re.sub(r"^\s*[●⏺•·]\s+", "", l) for l in lines[bi + 1:ei]]
-    return "\n".join(body).strip()
+        import asyncio
+        from fastmcp import Client
+
+        async def _go():
+            async with Client(NOTIFY_MCP_URL) as c:
+                await c.call_tool("notify", {"sender": NOTIFY_SENDER, "content": safe})
+
+        asyncio.run(_go())
+        LOG.info("operator notified via telegram-notify")
+    except Exception as e:  # pragma: no cover
+        LOG.warning("telegram notify failed: %s", e)
+
+
+def _finalize_error(status: str, sess: "Session", mode: str, reason: str,
+                    paced_s: float, extra: dict | None = None) -> dict:
+    """Fail-closed error result. STOPS (returns an error, never a guess) and, for the
+    configured statuses, calls a human to supervise via Telegram."""
+    payload = {"status": status, "verified": False, "paced_s": round(paced_s), "reason": reason}
+    if extra:
+        payload.update(extra)
+    if status in NOTIFY_ON:
+        _notify(f"[{status}] claude-pilot session={sess.sid} target={sess.target} "
+                f"mode={mode}\nreason: {reason}\n→ supervisione richiesta.")
+    return payload
 
 
 @mcp.tool

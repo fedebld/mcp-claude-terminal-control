@@ -22,8 +22,14 @@ interactively, without burning your own context on terminal frames. Use these to
   so **tables and code survive intact**. Needs shell approval, auto-granted only for the
   turn's own `/tmp/cp_<nonce>` file.
 - `"frame"`: answer wrapped between per-nonce BEGIN/END markers in the pane; exact extraction,
-  no tools/approvals, `verified:false`. **Plaintext only** — claude renders markdown/tables in
-  the pane, which mangles the markers; for tables/code/anything structured, use `"hash"`.
+  no tools/approvals, `verified:false`. **Plaintext only & fail-closed** — if claude renders
+  the output (markers mangled, box-drawing in the body, ambiguous), `claude_ask` returns
+  `{"status":"nondeterministic"}` and **does NOT guess**; it calls a human to supervise via the
+  telegram-notify gateway. For tables/code/anything structured, use `"hash"`.
+
+**Error handling.** On `nondeterministic`, `integrity_fail`, or `timeout` the facade STOPS
+(never returns a guessed answer) and notifies the operator on Telegram. Treat these as
+"halt for human supervision", not as something to silently retry.
 - `"none"`: legacy chrome-filtered scrape.
 
 Rule of thumb: keep `"hash"` for anything you'll act on; drop to `"frame"` for quick

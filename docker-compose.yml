@@ -43,6 +43,11 @@ services:
       ASK_TIMEOUT_S: "180"
       AUTO_APPROVE: "false"        # surface permission dialogs to the caller by default
       INTEGRITY_DEFAULT: "hash"    # verified file channel; "frame" (no tools) or "none" (legacy)
+      # --- operator call-out on determinism/verification failure (fail-closed) ---
+      NOTIFY_ENABLED: "true"
+      NOTIFY_MCP_URL: "http://100.94.187.21:8771/mcp"   # telegram-notify gateway
+      NOTIFY_SENDER: "claude-terminal-control"
+      NOTIFY_ON: "nondeterministic,integrity_fail,timeout"
       # AUTH_TOKEN: "set-me"       # optional Bearer on the HTTP layer (fail-closed if set)
     volumes:
       # The jump key, read-only. Mode 600 on the host; the container user shares its uid.
