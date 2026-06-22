@@ -371,8 +371,9 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
                 f"<<<CP nonce={nonce} sha256=HASH len=N>>>")
     elif mode == "frame":
         begin, end = f"<<<CPBEGIN {nonce}>>>", f"<<<CPEND {nonce}>>>"
-        line = (f"{p}   --- Racchiudi la risposta ESATTAMENTE tra due righe a se stanti: "
-                f"`{begin}` prima e `{end}` dopo. Nessun altro testo fuori da quelle due righe.")
+        line = (f"{p}   --- Rispondi in TESTO SEMPLICE (NIENTE tabelle renderizzate o code-fence). "
+                f"Metti il marker {begin} su una riga nuda PRIMA della risposta e {end} su una riga "
+                f"nuda DOPO. Nessun altro testo fuori da quei due marker.")
     else:
         marker = f"###CP-{nonce}###"
         line = f"{p}   [A fine risposta scrivi SOLO questo, su una riga separata: {marker}]"
@@ -406,17 +407,19 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
             if done:
                 break
         elif mode == "frame":
-            if any(l.strip() == end for l in captured.splitlines()):
+            if any(_mnorm(l) == end for l in captured.splitlines()):
                 done = True
                 break
         else:
             if any(l.strip() == marker for l in captured.splitlines()):
                 done = True
                 break
-        if "Do you want to proceed?" in captured or "Yes, and don" in captured:
+        if _DIALOG.search(captured):
+            # claude's dialogs vary by tool: Bash="Do you want to proceed?",
+            # Write="Do you want to create X?" — match the choice structure broadly.
             if AUTO_APPROVE or (mode == "hash" and _auto_ok(captured, nonce)):
                 _send_text(s.tmux, "1")  # 1 = Yes (hotkey)
-                time.sleep(0.6)
+                time.sleep(1.5)          # let the dialog clear before the next poll
             else:
                 needs_choice = True
                 break
@@ -483,24 +486,35 @@ def _extract_answer(captured: str, prompt_line: str, marker: str) -> str:
 # Zero-trust auto-approval: in hash mode, auto-confirm a permission dialog ONLY when it
 # references this turn's own /tmp/cp_<nonce> artifact AND a safe verb, and contains no
 # dangerous token. Anything else is surfaced to the caller.
+# Recognise a permission/selection dialog regardless of the tool's exact wording.
+_DIALOG = re.compile(r"Do you want to|❯\s*1\.\s*Yes|allow all edits")
 _SAFE_VERB = re.compile(r"\b(sha256sum|wc|cat|Write|Writing|Create|Update|Append)\b", re.I)
 _DANGER = re.compile(r"\b(rm\s+-rf|sudo|curl|wget|ssh|scp|nc|chmod|chown|mkfs|dd|eval|base64\s+-d)\b"
                      r"|>\s*/(?!tmp/cp_)", re.I)
 
 
 def _auto_ok(dialog: str, nonce: str) -> bool:
-    if f"/tmp/cp_{nonce}" not in dialog:
+    # Zero-trust scoping: only auto-approve when the dialog is about THIS turn's own
+    # cp_<nonce> artifact, uses a safe verb, and shows no dangerous token.
+    if f"cp_{nonce}" not in dialog:
         return False
     if _DANGER.search(dialog):
         return False
     return bool(_SAFE_VERB.search(dialog))
 
 
+def _mnorm(line: str) -> str:
+    """Normalise a captured line for marker matching: drop ANSI-residual backticks and a
+    leading assistant bullet (claude prints '● <<<CPBEGIN …>>>')."""
+    s = line.replace("`", "").strip()
+    return re.sub(r"^[●⏺•·]\s*", "", s).strip()
+
+
 def _extract_between(captured: str, begin: str, end: str) -> str:
     lines = captured.splitlines()
     try:
-        bi = max(i for i, l in enumerate(lines) if l.strip() == begin)
-        ei = min(i for i, l in enumerate(lines) if l.strip() == end and i > bi)
+        bi = max(i for i, l in enumerate(lines) if _mnorm(l) == begin)
+        ei = min(i for i, l in enumerate(lines) if _mnorm(l) == end and i > bi)
     except ValueError:
         return "(framing markers not found — inspect with claude_screen)"
     body = [re.sub(r"^\s*[●⏺•·]\s+", "", l) for l in lines[bi + 1:ei]]

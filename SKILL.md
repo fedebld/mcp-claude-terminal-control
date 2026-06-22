@@ -22,7 +22,8 @@ interactively, without burning your own context on terminal frames. Use these to
   so **tables and code survive intact**. Needs shell approval, auto-granted only for the
   turn's own `/tmp/cp_<nonce>` file.
 - `"frame"`: answer wrapped between per-nonce BEGIN/END markers in the pane; exact extraction,
-  no tools/approvals, `verified:false`.
+  no tools/approvals, `verified:false`. **Plaintext only** — claude renders markdown/tables in
+  the pane, which mangles the markers; for tables/code/anything structured, use `"hash"`.
 - `"none"`: legacy chrome-filtered scrape.
 
 Rule of thumb: keep `"hash"` for anything you'll act on; drop to `"frame"` for quick
