@@ -11,6 +11,23 @@ interactively, without burning your own context on terminal frames. Use these to
    `claude_screen` after a successful ask; the answer is the answer.
 3. Repeat `claude_ask`. When finished, `claude_close(session_id)`.
 
+## Integrity (v0.2 — Verifiable Framed Payload)
+
+`claude_ask` returns a **verified** answer by default. Modes via `integrity=`:
+
+- `"hash"` (default): claude writes the full answer to a file on the target and prints a
+  marker with `sha256`+`len` from real tools; the facade reads that file **out-of-band** and
+  **re-hashes** it. You get `{"status":"ok","verified":true,"sha256":…}` — or
+  `{"status":"integrity_fail"}` if anything was truncated/altered (fail-closed). Byte-exact,
+  so **tables and code survive intact**. Needs shell approval, auto-granted only for the
+  turn's own `/tmp/cp_<nonce>` file.
+- `"frame"`: answer wrapped between per-nonce BEGIN/END markers in the pane; exact extraction,
+  no tools/approvals, `verified:false`.
+- `"none"`: legacy chrome-filtered scrape.
+
+Rule of thumb: keep `"hash"` for anything you'll act on; drop to `"frame"` for quick
+interactive reads where approvals are inconvenient.
+
 ## Handling dialogs
 
 If `claude_ask` returns `{status:"needs_choice", dialog}`, the remote claude is asking for

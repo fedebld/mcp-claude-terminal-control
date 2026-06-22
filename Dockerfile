@@ -5,7 +5,7 @@ FROM python:3.12-slim
 LABEL org.opencontainers.image.title="mcp-claude-terminal-control" \
       org.opencontainers.image.description="MCP facade to drive a remote interactive claude TUI (tmux+ssh) via high-level intent tools" \
       org.opencontainers.image.source="https://github.com/fedebld/mcp-claude-terminal-control" \
-      org.opencontainers.image.version="0.1.0"
+      org.opencontainers.image.version="0.2.0"
 
 # tmux: holds the persistent interactive claude pane. openssh-client: reaches the claude box.
 RUN apt-get update \

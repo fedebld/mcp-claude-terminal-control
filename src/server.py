@@ -79,6 +79,8 @@ SCROLLBACK          = int(os.environ.get("SCROLLBACK", "3000"))
 AUTH_TOKEN          = os.environ.get("AUTH_TOKEN", "").strip()     # optional Bearer on the HTTP layer
 # Auto-approve permission dialogs. OFF by default: powerful, so surface to the caller.
 AUTO_APPROVE        = os.environ.get("AUTO_APPROVE", "false").lower() in ("1", "true", "yes")
+# Default answer-extraction mode: hash (verified file channel) | frame | none (legacy scrape).
+INTEGRITY_DEFAULT   = os.environ.get("INTEGRITY_DEFAULT", "hash").lower()
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -145,10 +147,9 @@ def _send_key(name: str, key: str) -> None:
     _tmux("send-keys", "-t", name, key)
 
 
-def _build_ssh_cmd(workdir: str | None) -> str:
-    remote = CLAUDE_CMD if not workdir else f"cd {shlex.quote(workdir)} && exec {CLAUDE_CMD}"
+def _ssh_base_argv() -> list[str]:
     argv = [
-        "ssh", "-tt",
+        "ssh",
         "-i", SSH_KEY,
         "-o", "BatchMode=yes",
         "-o", "IdentitiesOnly=yes",
@@ -159,8 +160,26 @@ def _build_ssh_cmd(workdir: str | None) -> str:
     ]
     if SSH_PROXYJUMP:
         argv += ["-J", SSH_PROXYJUMP]
-    argv += [SSH_TARGET, remote]
-    return shlex.join(argv)
+    return argv
+
+
+def _build_ssh_cmd(target: str, workdir: str | None) -> str:
+    remote = CLAUDE_CMD if not workdir else f"cd {shlex.quote(workdir)} && exec {CLAUDE_CMD}"
+    return shlex.join(_ssh_base_argv() + ["-tt", target, remote])
+
+
+def _ssh_exec(target: str, remote_cmd: str, timeout: int = 30) -> tuple[int, bytes]:
+    """Run a command on the target over a SEPARATE ssh, OUT-OF-BAND from the claude pane.
+    This is the zero-trust read path: the answer artifact is fetched at the source and
+    re-hashed here, never trusting the (lossy, ANSI-laden) terminal render."""
+    r = subprocess.run(_ssh_base_argv() + [target, remote_cmd],
+                       capture_output=True, timeout=timeout)
+    return r.returncode, r.stdout
+
+
+def _sha256_len(data: bytes) -> tuple[str, int]:
+    import hashlib
+    return hashlib.sha256(data).hexdigest(), len(data)
 
 
 # --------------------------------------------------------------------------- sessions
@@ -279,11 +298,7 @@ def claude_open(target: str | None = None, workdir: str | None = None) -> dict:
     sid = "cp_" + uuid.uuid4().hex[:8]
     name = f"cp_{sid}"
     tgt = target or SSH_TARGET
-    # one-off override of the ssh target without touching env
-    global_target_backup = None
-    if target:
-        global_target_backup = SSH_TARGET
-    ssh_cmd = _build_ssh_cmd(workdir) if not target else _build_ssh_cmd(workdir).replace(SSH_TARGET, tgt)
+    ssh_cmd = _build_ssh_cmd(tgt, workdir)
 
     r = _tmux("new-session", "-d", "-s", name, "-x", str(PANE_WIDTH), "-y", str(PANE_HEIGHT), ssh_cmd)
     if r.returncode != 0:
@@ -304,14 +319,23 @@ def claude_open(target: str | None = None, workdir: str | None = None) -> dict:
 
 @mcp.tool
 def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
-               timeout_s: int | None = None) -> dict:
-    """Send `prompt` to the session, wait for completion, return the clean answer.
+               timeout_s: int | None = None, integrity: str | None = None) -> dict:
+    """Send `prompt`, wait for completion, return the answer — by default *verified*.
 
-    Internally: optional blocking pace cooldown → inject a one-line sentinel instruction →
-    type the prompt → wait until claude prints the sentinel → strip ANSI and return only the
-    answer between the prompt echo and the sentinel.
+    integrity (Verifiable Framed Payload):
+      "hash"  (default) — claude writes the COMPLETE answer to /tmp/cp_<nonce> and prints a
+                          marker carrying sha256+len from `sha256sum`/`wc` (deterministic
+                          tools, not model math). The facade reads that file OUT-OF-BAND
+                          (separate ssh, never the pane), RE-computes sha256+len and verifies.
+                          Byte-exact; truncation/tamper ⇒ status="integrity_fail" (fail-closed).
+                          May need shell approval — auto-approved ONLY for this turn's
+                          /tmp/cp_<nonce> path (zero-trust scoping).
+      "frame" — answer wrapped between per-nonce BEGIN/END marker lines in the pane; the
+                facade extracts exactly between matched markers (deterministic boundaries,
+                no hash, no tools/approvals). verified=false.
+      "none"  — legacy best-effort chrome-filtered scrape. verified=false.
 
-    pace: if true (or PACING_DEFAULT), sleep a random 2–9 min BEFORE sending. Blocking.
+    pace: if true (or PACING_DEFAULT), sleep a random 2–9 min BEFORE sending (blocking).
     """
     with _LOCK:
         s = _SESSIONS.get(session_id)
@@ -325,6 +349,10 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
     if s.asks >= MAX_ASKS_PER_SESSION:
         return {"error": f"per-session ask cap reached ({MAX_ASKS_PER_SESSION})"}
 
+    mode = (integrity or INTEGRITY_DEFAULT).lower()
+    if mode not in ("hash", "frame", "none"):
+        return {"error": "integrity must be hash|frame|none"}
+
     paced_s = 0.0
     do_pace = PACING_DEFAULT if pace is None else pace
     if do_pace:
@@ -332,10 +360,22 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
         LOG.info("pacing session %s: sleeping %.0fs before prompt", s.sid, paced_s)
         time.sleep(paced_s)
 
-    marker = f"###CP-{uuid.uuid4().hex[:6]}###"
-    # Single line (newlines submit in the TUI). The marker text is echoed once; claude
-    # prints it again on its OWN line → completion = a line that, stripped, == marker.
-    line = f"{prompt.strip()}   [A fine risposta scrivi SOLO questo, su una riga separata: {marker}]"
+    nonce = uuid.uuid4().hex[:10]
+    p = prompt.strip()
+    if mode == "hash":
+        path = f"/tmp/cp_{nonce}.txt"
+        line = (f"{p}   --- IMPORTANTE: NON stampare la risposta nel terminale. Scrivi la "
+                f"risposta COMPLETA nel file {path} (usa il tool Write). Poi con Bash esegui "
+                f"`sha256sum {path}` e `wc -c {path}`. Infine stampa SOLO una riga, esattamente "
+                f"questa, sostituendo HASH e N con i valori reali: "
+                f"<<<CP nonce={nonce} sha256=HASH len=N>>>")
+    elif mode == "frame":
+        begin, end = f"<<<CPBEGIN {nonce}>>>", f"<<<CPEND {nonce}>>>"
+        line = (f"{p}   --- Racchiudi la risposta ESATTAMENTE tra due righe a se stanti: "
+                f"`{begin}` prima e `{end}` dopo. Nessun altro testo fuori da quelle due righe.")
+    else:
+        marker = f"###CP-{nonce}###"
+        line = f"{p}   [A fine risposta scrivi SOLO questo, su una riga separata: {marker}]"
 
     _send_text(s.tmux, line)
     time.sleep(0.25)
@@ -344,20 +384,39 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
     timeout = timeout_s or ASK_TIMEOUT_S
     deadline = time.time() + timeout
     captured = ""
+    claimed = None
     done = False
     needs_choice = False
     while time.time() < deadline:
         if not _tmux_running(s.tmux):
             break
         captured = _capture(s.tmux)
-        lines = captured.splitlines()
-        if any(l.strip() == marker for l in lines):
-            done = True
-            break
+        if mode == "hash":
+            # robust to spacing/order: the claimed line carries nonce + a 64-hex sha256 + len.
+            # The prompt echo has 'sha256=HASH' (not 64-hex) so it never false-matches.
+            for l in captured.splitlines():
+                if f"nonce={nonce}" not in l:
+                    continue
+                hm = re.search(r"sha256=([0-9a-fA-F]{64})", l)
+                lm = re.search(r"len=(\d+)", l)
+                if hm and lm:
+                    claimed = (hm.group(1).lower(), int(lm.group(1)))
+                    done = True
+                    break
+            if done:
+                break
+        elif mode == "frame":
+            if any(l.strip() == end for l in captured.splitlines()):
+                done = True
+                break
+        else:
+            if any(l.strip() == marker for l in captured.splitlines()):
+                done = True
+                break
         if "Do you want to proceed?" in captured or "Yes, and don" in captured:
-            if AUTO_APPROVE:
+            if AUTO_APPROVE or (mode == "hash" and _auto_ok(captured, nonce)):
                 _send_text(s.tmux, "1")  # 1 = Yes (hotkey)
-                time.sleep(0.5)
+                time.sleep(0.6)
             else:
                 needs_choice = True
                 break
@@ -374,10 +433,30 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
     if not done:
         tail = "\n".join(l for l in captured.splitlines() if not _looks_like_chrome(l))[-MAX_OUTPUT_CHARS:]
         return {"status": "timeout", "paced_s": round(paced_s),
-                "answer": tail[-MAX_OUTPUT_CHARS:], "note": f"no marker within {timeout}s"}
+                "answer": tail, "note": f"no completion within {timeout}s"}
 
+    # ---- post: verify / extract ----
+    if mode == "hash":
+        rc, data = _ssh_exec(s.target, f"cat {shlex.quote(path)}")
+        _ssh_exec(s.target, f"rm -f {shlex.quote(path)}")  # cleanup the per-turn artifact
+        if rc != 0:
+            return {"status": "integrity_fail", "verified": False, "paced_s": round(paced_s),
+                    "reason": "answer artifact unreadable at source"}
+        h, n = _sha256_len(data)
+        ch_h, ch_n = claimed
+        verified = (h == ch_h and n == ch_n)
+        answer = data.decode("utf-8", "replace").rstrip("\n")
+        return {"status": "ok" if verified else "integrity_fail", "verified": verified,
+                "paced_s": round(paced_s), "len": n, "sha256": h,
+                "claimed_len": ch_n, "claimed_sha256": ch_h,
+                "answer": answer[:MAX_OUTPUT_CHARS]}
+    if mode == "frame":
+        answer = _extract_between(captured, begin, end)
+        return {"status": "ok", "verified": False, "paced_s": round(paced_s),
+                "answer": answer[:MAX_OUTPUT_CHARS]}
     answer = _extract_answer(captured, line, marker)
-    return {"status": "ok", "paced_s": round(paced_s), "answer": answer[:MAX_OUTPUT_CHARS]}
+    return {"status": "ok", "verified": False, "paced_s": round(paced_s),
+            "answer": answer[:MAX_OUTPUT_CHARS]}
 
 
 def _extract_answer(captured: str, prompt_line: str, marker: str) -> str:
@@ -399,6 +478,33 @@ def _extract_answer(captured: str, prompt_line: str, marker: str) -> str:
         body.append(re.sub(r"^\s*[●⏺•·]\s+", "", l))
     out = "\n".join(body).strip()
     return out or "(no textual answer captured — try claude_screen)"
+
+
+# Zero-trust auto-approval: in hash mode, auto-confirm a permission dialog ONLY when it
+# references this turn's own /tmp/cp_<nonce> artifact AND a safe verb, and contains no
+# dangerous token. Anything else is surfaced to the caller.
+_SAFE_VERB = re.compile(r"\b(sha256sum|wc|cat|Write|Writing|Create|Update|Append)\b", re.I)
+_DANGER = re.compile(r"\b(rm\s+-rf|sudo|curl|wget|ssh|scp|nc|chmod|chown|mkfs|dd|eval|base64\s+-d)\b"
+                     r"|>\s*/(?!tmp/cp_)", re.I)
+
+
+def _auto_ok(dialog: str, nonce: str) -> bool:
+    if f"/tmp/cp_{nonce}" not in dialog:
+        return False
+    if _DANGER.search(dialog):
+        return False
+    return bool(_SAFE_VERB.search(dialog))
+
+
+def _extract_between(captured: str, begin: str, end: str) -> str:
+    lines = captured.splitlines()
+    try:
+        bi = max(i for i, l in enumerate(lines) if l.strip() == begin)
+        ei = min(i for i, l in enumerate(lines) if l.strip() == end and i > bi)
+    except ValueError:
+        return "(framing markers not found — inspect with claude_screen)"
+    body = [re.sub(r"^\s*[●⏺•·]\s+", "", l) for l in lines[bi + 1:ei]]
+    return "\n".join(body).strip()
 
 
 @mcp.tool

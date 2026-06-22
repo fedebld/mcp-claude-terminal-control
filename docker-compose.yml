@@ -18,7 +18,7 @@ services:
       context: .
       args:
         APP_UID: ${APP_UID:-1000}
-    image: mcp-claude-terminal-control:0.1
+    image: mcp-claude-terminal-control:0.2
     container_name: mcp_claude_terminal_control
     restart: unless-stopped
     environment:
@@ -42,6 +42,7 @@ services:
       MAX_ASKS_PER_SESSION: "200"
       ASK_TIMEOUT_S: "180"
       AUTO_APPROVE: "false"        # surface permission dialogs to the caller by default
+      INTEGRITY_DEFAULT: "hash"    # verified file channel; "frame" (no tools) or "none" (legacy)
       # AUTH_TOKEN: "set-me"       # optional Bearer on the HTTP layer (fail-closed if set)
     volumes:
       # The jump key, read-only. Mode 600 on the host; the container user shares its uid.
