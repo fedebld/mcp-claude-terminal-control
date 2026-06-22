@@ -21,11 +21,15 @@ interactively, without burning your own context on terminal frames. Use these to
   `{"status":"integrity_fail"}` if anything was truncated/altered (fail-closed). Byte-exact,
   so **tables and code survive intact**. Needs shell approval, auto-granted only for the
   turn's own `/tmp/cp_<nonce>` file.
-- `"frame"`: answer wrapped between per-nonce BEGIN/END markers in the pane; exact extraction,
-  no tools/approvals, `verified:false`. **Plaintext only & fail-closed** — if claude renders
-  the output (markers mangled, box-drawing in the body, ambiguous), `claude_ask` returns
-  `{"status":"nondeterministic"}` and **does NOT guess**; it calls a human to supervise via the
-  telegram-notify gateway. For tables/code/anything structured, use `"hash"`.
+- `"frame"`: **DISABLED** — returns `{"status":"disabled"}`. It read the answer from the
+  rendered pane, which is non-deterministic and unverifiable. Use `"hash"`.
+- `"none"`: legacy chrome-filtered scrape, explicit opt-in only, `verified:false`.
+
+**Why frame is disabled — decisional priority order (high → low):**
+1. Deterministic correctness · 2. Zero-trust verifiability (hash, not render-trust) ·
+3. Fail-closed + supervision · 4. Token economy · 5. Convenience/coverage.
+`frame` maximised (5) but broke (1)(2)(3); `hash` already covers the case *verified*, so
+`frame` was removed. `hash` is the only trusted path.
 
 **Error handling.** On `nondeterministic`, `integrity_fail`, or `timeout` the facade STOPS
 (never returns a guessed answer) and notifies the operator on Telegram. Treat these as

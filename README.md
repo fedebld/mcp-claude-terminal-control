@@ -42,6 +42,32 @@ ANSI, and waits for a per-prompt sentinel line that it asks `claude` to print wh
 
 Resources: `skill://claude-terminal-control`, `readme://claude-terminal-control`.
 
+## Answer integrity & the `frame` decision
+
+`claude_ask(integrity=…)` extraction modes:
+
+- **`hash`** (default, the only trusted path): claude writes the answer to a file on the
+  target and prints `sha256`+`len` from real tools; the facade reads it out-of-band and
+  re-hashes → `verified:true`, byte-exact, or `integrity_fail` (fail-closed).
+- **`none`**: legacy chrome-filtered pane scrape, explicit opt-in, `verified:false`.
+- **`frame`**: **DISABLED** — returns `{"status":"disabled"}`.
+
+**Why `frame` is disabled** (decisional priority order, high → low):
+
+1. **Deterministic correctness** — the answer is exact and reproducible
+2. **Zero-trust verifiability** — integrity proven by a hash, not by trusting the render
+3. **Fail-closed + supervision** — on any doubt, return an error and call a human; never guess
+4. **Token economy / latency**
+5. **Convenience / coverage** — answering without tools or permission prompts
+
+`frame` read the answer out of the **rendered** TUI pane, which the terminal reflows and
+box-draws. That maximised priority (5) — no tools, no approvals — but broke (1), (2) and (3):
+the output was non-deterministic and impossible to *prove* correct; at best it failed closed
+with an error. Since (1–3) outrank (5), and `hash` already covers the same use case **verified
+and byte-exact**, `frame` earned its keep nowhere and was removed. On
+`nondeterministic` / `integrity_fail` / `timeout`, the facade stops and calls the operator via
+the telegram-notify gateway.
+
 ## Delay-er
 
 `claude_ask(..., pace=true)` (or `PACING_DEFAULT=true`) blocks for a **randomized 2–9 min**

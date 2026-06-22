@@ -42,7 +42,8 @@ services:
       MAX_ASKS_PER_SESSION: "200"
       ASK_TIMEOUT_S: "180"
       AUTO_APPROVE: "false"        # surface permission dialogs to the caller by default
-      INTEGRITY_DEFAULT: "hash"    # verified file channel; "frame" (no tools) or "none" (legacy)
+      INTEGRITY_DEFAULT: "hash"    # verified file channel. 'frame' is DISABLED (non-deterministic);
+                                   # 'none' is legacy unverified. hash is the only trusted path.
       # --- operator call-out on determinism/verification failure (fail-closed) ---
       NOTIFY_ENABLED: "true"
       NOTIFY_MCP_URL: "http://100.94.187.21:8771/mcp"   # telegram-notify gateway

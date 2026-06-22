@@ -89,6 +89,26 @@ NOTIFY_SENDER       = os.environ.get("NOTIFY_SENDER", "claude-terminal-control")
 NOTIFY_ON           = {x.strip() for x in os.environ.get(
                           "NOTIFY_ON", "nondeterministic,integrity_fail,timeout").split(",") if x.strip()}
 
+# ── Decision: 'frame' mode is DISABLED (2026-06-22) ─────────────────────────────────
+# Decisional priority order (highest → lowest) that governs answer extraction:
+#   1. Deterministic correctness — the answer is exact and reproducible
+#   2. Zero-trust verifiability  — integrity proven by a hash, not by trusting the render
+#   3. Fail-closed + supervision — on any doubt return an error and call a human; never guess
+#   4. Token economy / latency
+#   5. Convenience / coverage    — answering without tools or permission prompts
+# 'frame' maximised (5) but violated (1),(2),(3): it reads claude's answer out of the
+# RENDERED tmux pane, which the TUI reflows and box-draws → non-deterministic and
+# unverifiable; at best it fails closed with an error (it can never *prove* correctness).
+# Because (1-3) outrank (5), and 'hash' already covers the same use case *verified and
+# byte-exact*, 'frame' had no reason to exist → disabled. It now returns status="disabled".
+# 'none' (legacy chrome-filtered scrape) is kept ONLY as an explicit, clearly-unverified
+# escape hatch (verified:false); 'hash' remains the default and the only trusted path.
+# ────────────────────────────────────────────────────────────────────────────────────
+FRAME_DISABLED_REASON = ("'frame' is disabled: it reads the answer from the rendered TUI pane, "
+                         "so it is non-deterministic and unverifiable. Use integrity='hash' "
+                         "(verified, byte-exact). Priority: correctness > verifiability > "
+                         "fail-closed > efficiency > convenience.")
+
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -337,11 +357,10 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
                           Byte-exact; truncation/tamper ⇒ status="integrity_fail" (fail-closed).
                           May need shell approval — auto-approved ONLY for this turn's
                           /tmp/cp_<nonce> path (zero-trust scoping).
-      "frame" — answer wrapped between per-nonce BEGIN/END marker lines in the pane; extracted
-                ONLY if the two markers are clean bare lines with no rendering artifacts.
-                Plaintext-only & fail-closed: if claude rendered the output (markers mangled),
-                returns status="nondeterministic" and notifies the operator — never a guess.
-      "none"  — legacy best-effort chrome-filtered scrape. verified=false.
+      "frame" — DISABLED (returns status="disabled"). It read the answer from the rendered
+                pane → non-deterministic and unverifiable. See the priority-order note in
+                this module. Use "hash".
+      "none"  — legacy best-effort chrome-filtered scrape, explicit opt-in only. verified=false.
 
     On nondeterministic / integrity_fail / timeout the facade STOPS and calls a human via the
     telegram-notify gateway (NOTIFY_*). It never returns a guessed answer on those.
@@ -361,8 +380,12 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
         return {"error": f"per-session ask cap reached ({MAX_ASKS_PER_SESSION})"}
 
     mode = (integrity or INTEGRITY_DEFAULT).lower()
-    if mode not in ("hash", "frame", "none"):
-        return {"error": "integrity must be hash|frame|none"}
+    if mode == "frame":
+        # Disabled by decision — see the priority-order note above. Fail-closed: refuse,
+        # don't silently fall back to a guess.
+        return {"status": "disabled", "verified": False, "reason": FRAME_DISABLED_REASON, "use": "hash"}
+    if mode not in ("hash", "none"):
+        return {"error": "integrity must be 'hash' (default, verified) or 'none' (legacy, unverified); 'frame' is disabled"}
 
     paced_s = 0.0
     do_pace = PACING_DEFAULT if pace is None else pace
