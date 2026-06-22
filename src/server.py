@@ -430,10 +430,14 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
         s.last_used = time.time()
 
     if needs_choice:
+        if mode == "hash":
+            _ssh_exec(s.target, f"rm -f {shlex.quote(path)}")  # don't orphan a half-written artifact
         dialog = "\n".join(l for l in _capture_screen(s.tmux).splitlines() if l.strip())[-1200:]
         return {"status": "needs_choice", "paced_s": round(paced_s),
                 "dialog": dialog, "hint": "call claude_choose(session_id, '1'|'2'|'3')"}
     if not done:
+        if mode == "hash":
+            _ssh_exec(s.target, f"rm -f {shlex.quote(path)}")  # cleanup on timeout too
         tail = "\n".join(l for l in captured.splitlines() if not _looks_like_chrome(l))[-MAX_OUTPUT_CHARS:]
         return {"status": "timeout", "paced_s": round(paced_s),
                 "answer": tail, "note": f"no completion within {timeout}s"}
