@@ -11,6 +11,29 @@ interactively, without burning your own context on terminal frames. Use these to
    `claude_screen` after a successful ask; the answer is the answer.
 3. Repeat `claude_ask`. When finished, `claude_close(session_id)`.
 
+## Orchestration mode (attached sessions)
+
+`claude_open`/`claude_ask` are *request -> one verified answer*. When you instead need to
+drive a **pre-existing**, long-running or HITL `claude` someone already launched in tmux on
+the target (e.g. a deploy session), use the **orchestration** tools:
+
+1. `claude_attach(tmux_session, target?)` -> adopt that tmux session ->
+   `{session_id, kind:"attached", state, tail}`.
+2. `claude_status(session_id)` -> `{state: working|idle|needs_choice|dead}` -- the tool
+   decides the state deterministically; you never interpret the rendered pane yourself.
+3. `claude_wait(session_id, timeout_s)` -> blocks until idle (working-spinner gone for N
+   samples) or a dialog appears; returns early on `needs_choice`.
+4. `claude_send(session_id, text)` -> fire-and-forget inject + submit (quote-safe via
+   paste-buffer over stdin). It does **not** wait -- pair it with `claude_wait` / `claude_tail`.
+5. `claude_tail(session_id, lines)` -> bounded, chrome-filtered progress (never a whole frame).
+6. `claude_choose(session_id, "1")` -> answer a dialog. `claude_close(session_id)` on an
+   attached session only **DETACHES** -- it never kills the remote tmux, and the idle reaper
+   never tears it down either.
+
+`claude_ask` **refuses** attached sessions (wrong model). For attached sessions every tmux op
+runs over ssh on the target (the same out-of-band channel `claude_ask` uses for the hash
+artifact). Typical loop: `attach -> status/wait/tail -> send/choose -> close(=detach)`.
+
 ## Integrity (v0.2 — Verifiable Framed Payload)
 
 `claude_ask` returns a **verified** answer by default. Modes via `integrity=`:
@@ -34,10 +57,8 @@ interactively, without burning your own context on terminal frames. Use these to
 **Error handling.** On `nondeterministic`, `integrity_fail`, or `timeout` the facade STOPS
 (never returns a guessed answer) and notifies the operator on Telegram. Treat these as
 "halt for human supervision", not as something to silently retry.
-- `"none"`: legacy chrome-filtered scrape.
-
-Rule of thumb: keep `"hash"` for anything you'll act on; drop to `"frame"` for quick
-interactive reads where approvals are inconvenient.
+Rule of thumb: keep `"hash"` for anything you'll act on; `"none"` only for quick throwaway
+reads (unverified). `"frame"` is disabled.
 
 ## Handling dialogs
 

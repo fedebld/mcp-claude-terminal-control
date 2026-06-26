@@ -39,8 +39,26 @@ ANSI, and waits for a per-prompt sentinel line that it asks `claude` to print wh
 | `claude_screen(session_id, mode?)` | minimal ANSI-stripped view (`tail`/`screen`/`full`) |
 | `claude_sessions()` | list active sessions |
 | `claude_close(session_id)` | tear a session down |
+| `claude_attach(tmux_session, target?)` | adopt a PRE-EXISTING tmux session (orchestration mode) |
+| `claude_send(session_id, text)` | fire-and-forget inject + submit, no wait |
+| `claude_wait(session_id, timeout_s)` | block until idle / dialog (deterministic) |
+| `claude_tail(session_id, lines)` | bounded chrome-filtered progress |
+| `claude_status(session_id)` | `{state: working\|idle\|needs_choice\|dead}` |
 
 Resources: `skill://claude-terminal-control`, `readme://claude-terminal-control`.
+
+## Orchestration mode (attached sessions)
+
+`claude_open` spawns a *local* tmux pane running `ssh -> claude`. To instead drive a
+**pre-existing** tmux session -- a long-running / HITL `claude` someone already launched on the
+target (e.g. a deploy) -- call `claude_attach(tmux_session)`. For attached sessions every tmux
+op runs **over ssh on the target** (the same out-of-band channel `claude_ask` uses for the hash
+artifact). Then orchestrate with `claude_send` (fire-and-forget inject), `claude_wait`
+(deterministic idle-detection -- spinner gone for N samples, early-return on a dialog),
+`claude_tail` (bounded progress) and `claude_status` (`working|idle|needs_choice|dead`, decided
+by the tool). `claude_ask` is for piloted sessions only and **refuses** attached ones.
+`claude_close` on an attached session **only detaches** -- it never kills the remote tmux, and
+the idle reaper never tears down attached sessions.
 
 ## Answer integrity & the `frame` decision
 
