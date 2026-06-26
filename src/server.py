@@ -22,6 +22,11 @@ Tools (progressive disclosure — the agent normally only needs claude_open + cl
   claude_screen(session_id, mode?)          → minimal, ANSI-stripped view (delta|tail|screen)
   claude_sessions()                         → list active piloted sessions
   claude_close(session_id)                  → tear a session down
+  claude_attach(tmux_session, target?)      → adopt a PRE-EXISTING tmux session (orchestration)
+  claude_send(session_id, text)             → fire-and-forget inject + submit (no wait)
+  claude_wait(session_id, timeout_s)        → block until idle / dialog (deterministic)
+  claude_tail(session_id, lines)            → bounded chrome-filtered progress
+  claude_status(session_id)                 → {state: working|idle|needs_choice|dead}
 
 Resources (self-discovery):
   skill://claude-terminal-control    → SKILL.md
@@ -219,6 +224,7 @@ class Session:
     created: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
     asks: int = 0
+    kind: str = "piloted"   # "piloted" (local tmux->ssh->claude) | "attached" (pre-existing remote tmux)
 
 
 _SESSIONS: dict[str, Session] = {}
@@ -229,13 +235,20 @@ def _reap_idle() -> None:
     now = time.time()
     with _LOCK:
         dead = [s for s in _SESSIONS.values()
-                if now - s.last_used > IDLE_TTL_S or not _tmux_running(s.tmux)]
+                if (s.kind != "attached" and now - s.last_used > IDLE_TTL_S)
+                or not _sess_running(s)]
     for s in dead:
         LOG.info("reaping idle/dead session %s", s.sid)
         _kill(s)
 
 
 def _kill(s: Session) -> None:
+    if s.kind == "attached":
+        # NEVER tear down a pre-existing remote tmux we merely attached to -- just deregister.
+        with _LOCK:
+            _SESSIONS.pop(s.sid, None)
+        LOG.info("detached %s (remote tmux %r on %s left running)", s.sid, s.tmux, s.target)
+        return
     try:
         if _tmux_running(s.tmux):
             _send_key(s.tmux, "C-c")
@@ -264,6 +277,92 @@ def _wait_for(name: str, needles, timeout: int, absent=None):
         time.sleep(POLL_INTERVAL_S)
     return False, last
 
+# ------------------------------------------------- session-aware tmux ops (piloted|attached)
+# "piloted" = a LOCAL tmux window whose pane runs `ssh -tt ... claude` (claude_open).
+# "attached" = a PRE-EXISTING tmux session living ON s.target (e.g. a long-running / HITL
+# `claude` someone launched in tmux on 269). For attached sessions every tmux command must run
+# OVER SSH on the target -- the facade's local tmux server can't see it. This is the same
+# out-of-band ssh channel claude_ask already uses to read the hash artifact, so it's proven.
+
+# "Working" = claude is mid-turn. Mirrors argo_wait.sh's spinner detection.
+_WORKING = re.compile(
+    r"esc to interrupt|interrupt\)|Thinking\u2026|Compacting|Running\u2026|Synthesizing|Warping",
+    re.I,
+)
+
+
+def _sess_running(s: "Session") -> bool:
+    if s.kind == "attached":
+        rc, _ = _ssh_exec(s.target, f"tmux has-session -t {shlex.quote(s.tmux)} 2>/dev/null")
+        return rc == 0
+    return _tmux_running(s.tmux)
+
+
+def _sess_capture(s: "Session") -> str:
+    """Scrollback, ANSI-stripped."""
+    if s.kind == "attached":
+        rc, out = _ssh_exec(s.target, f"tmux capture-pane -p -S -{SCROLLBACK} -t {shlex.quote(s.tmux)}")
+        return strip_ansi(out.decode("utf-8", "replace")) if rc == 0 else ""
+    return _capture(s.tmux)
+
+
+def _sess_capture_screen(s: "Session") -> str:
+    """Current visible pane, ANSI-stripped."""
+    if s.kind == "attached":
+        rc, out = _ssh_exec(s.target, f"tmux capture-pane -p -t {shlex.quote(s.tmux)}")
+        return strip_ansi(out.decode("utf-8", "replace")) if rc == 0 else ""
+    return _capture_screen(s.tmux)
+
+
+def _sess_send_key(s: "Session", key: str) -> None:
+    if s.kind == "attached":
+        _ssh_exec(s.target, f"tmux send-keys -t {shlex.quote(s.tmux)} {shlex.quote(key)}")
+    else:
+        _send_key(s.tmux, key)
+
+
+def _sess_send_text(s: "Session", text: str) -> None:
+    """Type literal text (no key-name interpretation). For short strings / hotkeys."""
+    if s.kind == "attached":
+        _ssh_exec(s.target, f"tmux send-keys -t {shlex.quote(s.tmux)} -l {shlex.quote(text)}")
+    else:
+        _send_text(s.tmux, text)
+
+
+def _sess_paste(s: "Session", text: str) -> None:
+    """Quote-safe injection of an arbitrary multi-line payload via a tmux paste-buffer. The text
+    is delivered over STDIN (never as an inline shell arg) -- the only robust way to pass
+    apostrophes/quotes/newlines to a remote shell."""
+    nonce = uuid.uuid4().hex[:8]
+    buf = f"cps_{nonce}"
+    if s.kind == "attached":
+        tmpf = f"/tmp/{buf}.txt"
+        remote = (f"cat > {tmpf}; tmux load-buffer -b {buf} {tmpf}; "
+                  f"tmux paste-buffer -p -b {buf} -t {shlex.quote(s.tmux)}; rm -f {tmpf}")
+        subprocess.run(_ssh_base_argv() + [s.target, remote],
+                       input=text.encode("utf-8"), capture_output=True, timeout=30)
+    else:
+        subprocess.run(["tmux", "load-buffer", "-b", buf, "-"],
+                       input=text.encode("utf-8"), capture_output=True, timeout=15)
+        _tmux("paste-buffer", "-p", "-b", buf, "-t", s.tmux)
+
+
+def _sess_state(s: "Session", screen: str | None = None) -> str:
+    """Deterministic state enum so the CALLER never interprets the rendered pane itself."""
+    if not _sess_running(s):
+        return "dead"
+    scr = screen if screen is not None else _sess_capture_screen(s)
+    if _DIALOG.search(scr):
+        return "needs_choice"
+    if _WORKING.search(scr):
+        return "working"
+    return "idle"
+
+
+def _clean_tail(text: str, n: int) -> str:
+    lines = [l for l in text.splitlines() if l.strip() and not _looks_like_chrome(l)]
+    return "\n".join(lines[-max(1, n):])
+
 
 # --------------------------------------------------------------------------- MCP app
 mcp = FastMCP(
@@ -276,7 +375,10 @@ mcp = FastMCP(
         "`claude_choose` to answer permission/selection dialogs, `claude_screen` for a minimal "
         "view, and `claude_close` when done. A blocking delay-er can pace prompts by a random "
         "2–9 min cooldown (pace=true). Designed to keep YOUR context tiny: it returns answers, "
-        "not terminal redraws."
+        "not terminal redraws. For a PRE-EXISTING long-running/HITL claude you did not "
+        "open, use claude_attach(tmux_session) then claude_send / claude_wait / claude_tail "
+        "/ claude_status (orchestration mode); claude_close only DETACHES an attached "
+        "session, it never kills it."
     ),
 )
 
@@ -371,6 +473,10 @@ def claude_ask(session_id: str, prompt: str, pace: bool | None = None,
         s = _SESSIONS.get(session_id)
     if not s:
         return {"error": "unknown session_id (open one with claude_open)"}
+    if s.kind == "attached":
+        return {"error": "claude_ask is for piloted sessions (request->one verified answer). "
+                "For an attached/long-running session use claude_send + claude_wait + "
+                "claude_tail (orchestration mode)."}
     if not _tmux_running(s.tmux):
         _kill(s)
         return {"error": "session is dead; open a new one"}
@@ -620,20 +726,20 @@ def claude_choose(session_id: str, option: str) -> dict:
     name: 'enter', 'up', 'down', 'esc'. Returns a short screen delta."""
     with _LOCK:
         s = _SESSIONS.get(session_id)
-    if not s or not _tmux_running(s.tmux):
+    if not s or not _sess_running(s):
         return {"error": "unknown or dead session"}
     opt = option.strip().lower()
     keymap = {"enter": "Enter", "up": "Up", "down": "Down", "esc": "Escape", "tab": "BTab"}
     if opt in keymap:
-        _send_key(s.tmux, keymap[opt])
+        _sess_send_key(s, keymap[opt])
     elif opt.isdigit():
-        _send_text(s.tmux, opt)         # numeric hotkey selects+confirms in claude
+        _sess_send_text(s, opt)         # numeric hotkey selects+confirms in claude
     else:
         return {"error": "option must be a digit or one of enter/up/down/esc/tab"}
     time.sleep(1.0)
     with _LOCK:
         s.last_used = time.time()
-    screen = "\n".join(l for l in _capture_screen(s.tmux).splitlines() if l.strip())[-1000:]
+    screen = "\n".join(l for l in _sess_capture_screen(s).splitlines() if l.strip())[-1000:]
     return {"status": "ok", "screen": screen}
 
 
@@ -643,14 +749,14 @@ def claude_screen(session_id: str, mode: str = "tail", lines: int = 20) -> dict:
     'screen' (current visible pane), 'full' (scrollback, capped)."""
     with _LOCK:
         s = _SESSIONS.get(session_id)
-    if not s or not _tmux_running(s.tmux):
+    if not s or not _sess_running(s):
         return {"error": "unknown or dead session"}
     if mode == "screen":
-        txt = _capture_screen(s.tmux)
+        txt = _sess_capture_screen(s)
     elif mode == "full":
-        txt = _capture(s.tmux)[-MAX_OUTPUT_CHARS:]
+        txt = _sess_capture(s)[-MAX_OUTPUT_CHARS:]
     else:
-        non_empty = [l for l in _capture(s.tmux).splitlines() if l.strip()]
+        non_empty = [l for l in _sess_capture(s).splitlines() if l.strip()]
         txt = "\n".join(non_empty[-max(1, min(lines, 200)):])
     return {"status": "ok", "content": txt[-MAX_OUTPUT_CHARS:]}
 
@@ -660,10 +766,10 @@ def claude_sessions() -> dict:
     """List active piloted sessions."""
     _reap_idle()
     with _LOCK:
-        out = [{"session_id": s.sid, "target": s.target, "asks": s.asks,
-                "age_s": round(time.time() - s.created),
+        out = [{"session_id": s.sid, "kind": s.kind, "target": s.target, "tmux": s.tmux,
+                "asks": s.asks, "age_s": round(time.time() - s.created),
                 "idle_s": round(time.time() - s.last_used),
-                "alive": _tmux_running(s.tmux)} for s in _SESSIONS.values()]
+                "alive": _sess_running(s)} for s in _SESSIONS.values()]
     return {"sessions": out, "count": len(out), "max": MAX_SESSIONS}
 
 
@@ -676,6 +782,138 @@ def claude_close(session_id: str) -> dict:
         return {"error": "unknown session_id"}
     _kill(s)
     return {"status": "closed", "session_id": session_id}
+
+# ---------------------------------------------------------- orchestration mode (attached)
+@mcp.tool
+def claude_attach(tmux_session: str, target: str | None = None, workdir: str | None = None) -> dict:
+    """Adopt a PRE-EXISTING tmux session (one you did NOT open with claude_open) so the other
+    tools can drive it. Use this for a long-running / HITL `claude` someone already launched in
+    tmux on the target box (e.g. a deploy session).
+
+    tmux_session : the tmux session NAME or index on the target (e.g. "10").
+    target       : ssh target hosting that tmux (default SSH_TARGET).
+    Returns {session_id, kind:"attached", state, tail}. claude_close on it only DETACHES --
+    it NEVER kills the remote session.
+    """
+    _reap_idle()
+    tgt = target or SSH_TARGET
+    rc, _ = _ssh_exec(tgt, f"tmux has-session -t {shlex.quote(tmux_session)} 2>/dev/null")
+    if rc != 0:
+        return {"error": f"no tmux session {tmux_session!r} on {tgt} (check `tmux ls` there)"}
+    with _LOCK:
+        for s in _SESSIONS.values():
+            if s.kind == "attached" and s.tmux == tmux_session and s.target == tgt:
+                return {"session_id": s.sid, "kind": "attached", "target": tgt,
+                        "note": "already attached", "state": _sess_state(s)}
+        if len(_SESSIONS) >= MAX_SESSIONS:
+            return {"error": f"session cap reached ({MAX_SESSIONS}); close one first"}
+    sid = "at_" + uuid.uuid4().hex[:8]
+    sess = Session(sid=sid, tmux=tmux_session, target=tgt, workdir=workdir, kind="attached")
+    with _LOCK:
+        _SESSIONS[sid] = sess
+    screen = _sess_capture_screen(sess)
+    return {"session_id": sid, "kind": "attached", "target": tgt, "tmux": tmux_session,
+            "state": _sess_state(sess, screen), "tail": _clean_tail(screen, 20)}
+
+
+@mcp.tool
+def claude_send(session_id: str, text: str) -> dict:
+    """Fire-and-forget: inject `text` and submit it, returning immediately (NO wait for
+    completion). Quote-safe (paste-buffer over stdin). Pair with claude_wait to block until idle
+    and claude_tail to read progress. Orchestration-mode counterpart to claude_ask (which is
+    request->one verified answer, piloted sessions only)."""
+    with _LOCK:
+        s = _SESSIONS.get(session_id)
+    if not s:
+        return {"error": "unknown session_id"}
+    if not _sess_running(s):
+        _kill(s)
+        return {"error": "session is dead"}
+    if len(text) > MAX_PROMPT_CHARS:
+        return {"error": f"text too long (>{MAX_PROMPT_CHARS} chars)"}
+    if _sess_state(s) == "needs_choice":
+        return {"status": "needs_choice",
+                "hint": "a dialog is open; answer it with claude_choose first",
+                "tail": _clean_tail(_sess_capture_screen(s), 16)}
+    _sess_paste(s, text)
+    time.sleep(0.4)
+    _sess_send_key(s, "Enter")
+    time.sleep(0.6)
+    with _LOCK:
+        s.asks += 1
+        s.last_used = time.time()
+    screen = _sess_capture_screen(s)
+    return {"status": "sent", "chars": len(text), "state": _sess_state(s, screen),
+            "tail": _clean_tail(screen, 12)}
+
+
+@mcp.tool
+def claude_wait(session_id: str, timeout_s: int = 600, settle: int = 3) -> dict:
+    """Block until the session looks idle -- the working spinner ("esc to interrupt",
+    "Thinking", etc.) absent for `settle` consecutive samples -- or until a dialog appears, or
+    timeout. Deterministic idle-detection so YOU never decide "is it done?" from the pane.
+    Returns {idle, state, waited_s, tail}; state is idle|needs_choice|working|dead."""
+    with _LOCK:
+        s = _SESSIONS.get(session_id)
+    if not s:
+        return {"error": "unknown session_id"}
+    timeout_s = max(2, min(int(timeout_s), 3600))
+    settle = max(1, min(int(settle), 10))
+    start = time.time()
+    quiet = 0
+    while time.time() - start < timeout_s:
+        if not _sess_running(s):
+            return {"idle": False, "state": "dead", "waited_s": round(time.time() - start)}
+        screen = _sess_capture_screen(s)
+        if _DIALOG.search(screen):
+            with _LOCK:
+                s.last_used = time.time()
+            return {"idle": False, "state": "needs_choice",
+                    "waited_s": round(time.time() - start), "tail": _clean_tail(screen, 16)}
+        if _WORKING.search(screen):
+            quiet = 0
+        else:
+            quiet += 1
+            if quiet >= settle:
+                with _LOCK:
+                    s.last_used = time.time()
+                return {"idle": True, "state": "idle",
+                        "waited_s": round(time.time() - start), "tail": _clean_tail(screen, 16)}
+        time.sleep(2)
+    return {"idle": False, "state": "working", "waited_s": round(time.time() - start),
+            "tail": _clean_tail(_sess_capture_screen(s), 16), "note": "timeout"}
+
+
+@mcp.tool
+def claude_tail(session_id: str, lines: int = 30) -> dict:
+    """Last N non-empty, chrome-filtered, ANSI-stripped lines of the pane (capped). The bounded,
+    low-context way to read progress without shipping a whole terminal frame."""
+    with _LOCK:
+        s = _SESSIONS.get(session_id)
+    if not s or not _sess_running(s):
+        return {"error": "unknown or dead session"}
+    with _LOCK:
+        s.last_used = time.time()
+    tail = _clean_tail(_sess_capture(s), max(1, min(lines, 200)))
+    return {"status": "ok", "state": _sess_state(s), "content": tail[-MAX_OUTPUT_CHARS:]}
+
+
+@mcp.tool
+def claude_status(session_id: str) -> dict:
+    """One-shot deterministic status: {state, kind, asks, idle_s, age_s, last_lines}. state is
+    working|idle|needs_choice|dead -- the tool decides it, not the model."""
+    with _LOCK:
+        s = _SESSIONS.get(session_id)
+    if not s:
+        return {"error": "unknown session_id"}
+    screen = _sess_capture_screen(s)
+    state = _sess_state(s, screen)
+    idle_s = round(time.time() - s.last_used)
+    with _LOCK:
+        s.last_used = time.time()
+    return {"status": "ok", "state": state, "kind": s.kind, "target": s.target,
+            "tmux": s.tmux, "asks": s.asks, "age_s": round(time.time() - s.created),
+            "idle_s": idle_s, "last_lines": _clean_tail(screen, 12)}
 
 
 # ------------------------------------------------------------------ optional bearer
